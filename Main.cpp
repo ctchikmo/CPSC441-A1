@@ -53,9 +53,9 @@ int main(int argc, char const* argv[])
 	ss2.clear();
 	// At this point maxClients has the user entered integer value.
 	
-	if(maxClients < 1 || maxClients > 31)
+	if(maxClients < 1 || maxClients > 100)
 	{
-		std::cout << "client threads count invalid, must be in the range 1-31" << std::endl;
+		std::cout << "client threads count invalid, must be in the range 1-100" << std::endl;
 		exit(1);
 	}
 	

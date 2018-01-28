@@ -10,6 +10,8 @@
 #include "Server.h"
 #include "ClientHandler.h"
 
+#define MAX_ACCEPT_BACKLOG_QUEUE 128 // If something goes wrong with this queue backing up the underlying accept implementation calls exit() and I have no idea how to get around it other than by having this be large. 
+
 Server::Server(int port, int maxClients) 
 : port(port),
   maxClients(maxClients)
@@ -67,7 +69,7 @@ void Server::startServer()
 		exit(1);
 	}
 	
-	if(listen(servSocket, maxClients) < 0) // Start listening for connections, we have a backlog queue size of maxClients.
+	if(listen(servSocket, MAX_ACCEPT_BACKLOG_QUEUE) < 0) 
 	{
 		std::cout << "There was an error when starting to listen on the server socket." << std::endl;
 		exit(1);
@@ -100,11 +102,12 @@ void Server::directRequests()
 		if(clientSocket < 0)
 		{
 			std::cout << "There was an error when accepting a connection on the server socket." << std::endl;
-			exit(1);
+			break;
 		}
 		
 		clh->startRequest(clientSocket); // The clh will close the socket for us.
 	}
 	
+	std::cout << "serer close" << std::endl;
 	close(servSocket);
 }

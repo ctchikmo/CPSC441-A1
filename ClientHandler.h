@@ -26,16 +26,17 @@ class ClientHandler
 		pthread_cond_t reqCond;
 		
 		// Browser variables. 
-		int browserSocket = 0; // This socket is already setup by connecting to the server, thus I can just read and write with it.
-		std::string str_browserInput; // String holding browser input.
-		char returnToBrowser[1024] = {0}; // This is the full response from the webServer, the buffer will be filled after each range request and sent to the browser upon completion. 
+		int browserSocket = -1; // This socket is already setup by connecting to the server, thus I can just read and write with it.
 		
 		// Webserver variables
-		int webServerSocket = 0;
+		int webServerSocket = -1;
 		struct sockaddr_in webServerAddr;
 		
 		void handleRequest();
-		void connectWebserver();
+		bool connectWebserver(const std::string &str_initBrowserReq);
+		
+		std::string getStringAt(const std::string &str_key, const std::string &str_src);
+		int stringToInt(const std::string &s);
 		static void* threadStarter(void* cl);
 		static int hostnameToIP(const char* hostname, char* rvIP);
 };
