@@ -17,7 +17,6 @@
 
 #define HEADER_RESPONSE_EST_SIZE 600 // Im hoping I provide a large enough buffer. 
 #define HTTP_PORT 80 // NOTE: WE ARE NOT DOING HTTPS!! (Bless cause that was going to be really tough otherwise.)
-#define RANGE_AMOUNT 100 
 
 ClientHandler::ClientHandler(Server* server)
 : server(server),
@@ -72,6 +71,7 @@ void ClientHandler::wait()
 		close(webServerSocket);
 		close(browserSocket);
 		webServerSocket = -1;
+		browserSocket = -1;
 	}
 }
 
@@ -79,6 +79,8 @@ void ClientHandler::wait()
 // Once this method is done it will return to where it was called in the wait method. 
 // Note: I am forcing a Connection: close, thus we need to reconnect to the webserver before every send
 // During handle request there is no interference!! This means I do not need to worry about mutexes
+// SIGPIPE caused quite the headache, but from what I found on https://stackoverflow.com/questions/108183/how-to-prevent-sigpipes-or-handle-them-properly looks like I can ignore for multithreaded.
+// Note that I'm not listing the linux man page resources as those are pretty self-explanatory. 
 void ClientHandler::handleRequest() 
 {
 	bool slowDown = false;
@@ -99,7 +101,7 @@ void ClientHandler::handleRequest()
 	if(!connectWebserver(str_browserInput))
 	{
 		char noConnect[] = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
-		send(browserSocket, noConnect, 47, 0);
+		send(browserSocket, noConnect, 47, MSG_NOSIGNAL);
 		return;
 	}
 	
@@ -151,7 +153,7 @@ void ClientHandler::handleRequest()
 	if((str_headResp.find("Content-Type: ") != std::string::npos) && (getStringAt("Content-Type: ", str_headResp).find("html") != std::string::npos) 
 		&& (str_headResp.find("Accept-Ranges: ") != std::string::npos) && (getStringAt("Accept-Ranges: ", str_headResp).find("bytes") != std::string::npos))
 	{
-		std::string str_range = "Range: bytes=0-" + std::to_string(RANGE_AMOUNT - 1) + "\r\n";
+		std::string str_range = "Range: bytes=0-" + std::to_string(server->sloxyRangeRate - 1) + "\r\n";
 		str_browserInput.insert(str_browserInput.rfind("\r\n"), str_range.c_str(), str_range.size());
 		slowDown = true;
 	}
@@ -184,61 +186,96 @@ void ClientHandler::handleRequest()
 	}
 	std::string str_getResp(getResp, getHeaderbytes);
 	
+	// This is handling excess body bytes that have not yet been picked up by the recieve, and in the case of slowDown (which makes more response headers) these bytes will be missed at the final loop. 
+	// The calculation is: if body bytes recieved (header - endEnd) is not equal to the range amount obtained then pick them up here and add em in. 
+	unsigned int getHeaderBodyExtraBytes = 0;
+	if(slowDown)
+	{
+		getHeaderBodyExtraBytes = stringToInt(getStringAt("Content-Length: ", str_getResp)); // Must do this and not just use the server->sloxyRangeRate value, in case there are less than server->sloxyRangeRate sent. 
+		if((getHeaderbytes - (headEnd + 4)) != getHeaderBodyExtraBytes)
+		{
+			int getHeaderBodyBytesLeft = getHeaderBodyExtraBytes - (getHeaderbytes - (headEnd + 4));
+			int totalBytes = getHeaderBodyBytesLeft;
+			char buff[getHeaderBodyBytesLeft] = {0};
+			while(getHeaderBodyBytesLeft > 0) // Some sites may stop sending because its EOF, even though the full file size has not been sent, I dunno why, but when this happens recv returns 0. 
+			{	
+				int bytesGrabbed = recv(webServerSocket, buff + totalBytes - getHeaderBodyBytesLeft, getHeaderBodyBytesLeft, 0); // I know recv blocks, own thread, and lets it be compatible with windows + unix.
+				getHeaderBodyBytesLeft -= bytesGrabbed;
+				
+				if(bytesGrabbed == 0)
+					break;
+			}
+			str_getResp.append(buff, totalBytes);
+		}
+	}
+	
 	if(str_getResp.find("Content-Length: ") == std::string::npos) // No content-length, so we will assume there is no body for whatever reason. 
+	{
+		send(browserSocket, str_getResp.c_str(), str_getResp.size(), MSG_NOSIGNAL); // Don't care if this errors or not, future sends are not affected. 
 		return;
+	}
 	
 	// The recv above is guranteed to fetch all of the header, however it might also fetch some of the body, this portion of the body fetched is already sent with the header. 
 	int bodyBytes = 0;
 	if(slowDown) // Range uses the end of Content-Range for the full amount. 
 	{
-		bodyBytes = stringToInt(getStringAt("Content-Range: bytes 0-" + std::to_string(RANGE_AMOUNT - 1) + "/", str_getResp)) - (getHeaderbytes - (headEnd + 4)); // The getStringAt is always that. 
+		bodyBytes = stringToInt(getStringAt("Content-Range: bytes 0-" + std::to_string(server->sloxyRangeRate - 1) + "/", str_getResp)); // The getStringAt is always that. 
 		
 		// I need to change the content-length to be the full amount before sending back to the browser so it accepts the full file. 
 		str_getResp.erase(str_getResp.find("Content-Length: ") + 16, getStringAt("Content-Length: ", str_getResp).length());
-		str_getResp.insert(str_getResp.find("Content-Length: ") + 16, std::to_string(bodyBytes + (getHeaderbytes - (headEnd + 4))));
+		str_getResp.insert(str_getResp.find("Content-Length: ") + 16, std::to_string(bodyBytes));
+		
+		 // Remove both the bodybytes obtained in the header recv and the following straggler pickup
+		 bodyBytes -= getHeaderBodyExtraBytes;
 	}
 	else
 		bodyBytes = stringToInt(getStringAt("Content-Length: ", str_getResp)) - (getHeaderbytes - (headEnd + 4));
 		
-	if(bodyBytes <= 0) // Sometimes no body message is sent, so we return.
+	int sRv = send(browserSocket, str_getResp.c_str(), str_getResp.size(), MSG_NOSIGNAL); // Send the Header bytes here, then later we read in the body and send it. (Done like this to avoid another GET request).
+	if(sRv == -1) // Error, most likely socket closed cause user stopped the page. 
 		return;
 		
-	send(browserSocket, str_getResp.c_str(), str_getResp.size(), 0); // Send the Header bytes here, then later we read in the body and send it. (Done like this to avoid another GET request).
+	if(bodyBytes <= 0) // Sometimes no body message is sent, so we return.
+		return;
 	
 	int rangeCount = 2;
 	int bytesRemaining = bodyBytes;
 	char* finalResponse = new char[bodyBytes]; // Don't do this on the stack, cause we might get an overflow exception. Firefox couldnt update, so i did some calcs on the content-length. It was ~19MB and cygwin stack is 1.8MB
 	while(bytesRemaining > 0) // Some sites may stop sending because its EOF, even though the full file size has not been sent, I dunno why, but when this happens recv returns 0. 
 	{
-		if(slowDown && (RANGE_AMOUNT * (rangeCount - 1)) <= bodyBytes)
+		int bytesGrabbed;
+		if(slowDown)
 		{
+			unsigned int endRangeValue = (server->sloxyRangeRate * rangeCount) - 1;
+			if(endRangeValue > bodyBytes + getHeaderBodyExtraBytes) // Handle out of range case.
+				endRangeValue -= server->sloxyRangeRate - bytesRemaining;
+			
 			str_browserInput.erase(str_browserInput.rfind("=") + 1, std::string::npos);
-			str_browserInput += std::to_string(RANGE_AMOUNT * (rangeCount - 1)) + "-" + std::to_string(RANGE_AMOUNT * rangeCount - 1) + "\r\n\r\n"; // This is always the last line.
+			str_browserInput += std::to_string(server->sloxyRangeRate * (rangeCount - 1)) + "-" + std::to_string(endRangeValue) + "\r\n\r\n"; // This is always the last line.
 			rangeCount++;
 			
 			connectWebserver(str_browserInput);
 			send(webServerSocket, str_browserInput.c_str(), str_browserInput.size(), 0);	
-		}
-		
-		int bytesGrabbed;
-		if(slowDown)
-		{
-			char resp[RANGE_AMOUNT + HEADER_RESPONSE_EST_SIZE] = {0};
-			bytesGrabbed = recv(webServerSocket, resp, RANGE_AMOUNT + HEADER_RESPONSE_EST_SIZE, 0); 
+			
+			char resp[server->sloxyRangeRate + HEADER_RESPONSE_EST_SIZE] = {0};
+			bytesGrabbed = recv(webServerSocket, resp, server->sloxyRangeRate + HEADER_RESPONSE_EST_SIZE, 0); 
 		
 			int bodyStart = 4;
-			for(; bodyStart < HEADER_RESPONSE_EST_SIZE; bodyStart++)
+			for(; bytesGrabbed >= 4 && bodyStart < HEADER_RESPONSE_EST_SIZE; bodyStart++)
 				if((resp[bodyStart - 4] == '\r' && resp[bodyStart - 3] == '\n' && resp[bodyStart - 2] == '\r' && resp[bodyStart - 1] == '\n')) // End of header
 					break;
 					
+			int sendRv = send(browserSocket, resp + bodyStart, bytesGrabbed - bodyStart, MSG_NOSIGNAL);
+			if(sendRv == -1) // Error, most likely socket closed cause user stopped the page. 
+				break;
 			bytesRemaining -= (bytesGrabbed - bodyStart);
-			
-			for(int i = bodyStart; i < bytesGrabbed; i++)
-				finalResponse[bodyBytes - bytesRemaining + (i - bodyStart)] = resp[i];
 		}
 		else
 		{
 			bytesGrabbed = recv(webServerSocket, finalResponse + bodyBytes - bytesRemaining, bytesRemaining, 0); // I know recv blocks, own thread, and lets it be compatible with windows + unix.
+			int sendRv = send(browserSocket, finalResponse + bodyBytes - bytesRemaining, bytesGrabbed, MSG_NOSIGNAL);
+			if(sendRv == -1) // Error, most likely socket closed cause user stopped the page. 
+				break;
 			bytesRemaining -= bytesGrabbed;
 		}
 		
@@ -246,8 +283,6 @@ void ClientHandler::handleRequest()
 			break;
 	}
 	
-	// I could send right after recieving in the while, but then I would need to block until the send is done each time. std::cout << str_getResp << std::string(finalResponse, bodyBytes) << std::endl;
-	send(browserSocket, finalResponse, bodyBytes, 0); // Browser connection does not need to be checked for close.
 	delete[] finalResponse;
 }
 

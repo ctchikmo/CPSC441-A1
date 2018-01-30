@@ -17,8 +17,9 @@ class Server
 	public:
 		int port = 0;
 		int maxClients = 0;
+		int sloxyRangeRate = 25;
 		
-		Server(int port, int maxClients);
+		Server(int port, int maxClients, int rangeRate);
 		~Server();
 		
 		void makeAvailable(ClientHandler* cl);
@@ -28,7 +29,7 @@ class Server
 		struct sockaddr_in serv_addr; // Socket Addressing information. 
 		pthread_mutex_t queueMutex;
 		pthread_cond_t queueCond;
-		std::queue<ClientHandler*> CHqueue_available;  					//TODO::::: ADD LATER SOMETING TO HANDLE EXCESS REQUESTS
+		std::queue<ClientHandler*> CHqueue_available;
 		
 		void startServer();
 		void directRequests();

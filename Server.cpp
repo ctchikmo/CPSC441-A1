@@ -12,9 +12,10 @@
 
 #define MAX_ACCEPT_BACKLOG_QUEUE 128 // If something goes wrong with this queue backing up the underlying accept implementation calls exit() and I have no idea how to get around it other than by having this be large. 
 
-Server::Server(int port, int maxClients) 
+Server::Server(int port, int maxClients, int rangeRate) 
 : port(port),
-  maxClients(maxClients)
+  maxClients(maxClients),
+  sloxyRangeRate(rangeRate)
 {
 	pthread_mutex_init(&queueMutex, NULL);
 	pthread_cond_init(&queueCond, NULL);
