@@ -15,8 +15,9 @@
 #include "ClientHandler.h"
 #include "Server.h"
 
+#define HEADER_RESPONSE_EST_SIZE 600 // Im hoping I provide a large enough buffer. 
 #define HTTP_PORT 80 // NOTE: WE ARE NOT DOING HTTPS!! (Bless cause that was going to be really tough otherwise.)
-#define HEADER_RESPONSE_EST_SIZE 1500 // Im hoping I provide a large enough buffer. 
+#define RANGE_AMOUNT 100 
 
 ClientHandler::ClientHandler(Server* server)
 : server(server),
@@ -68,16 +69,20 @@ void ClientHandler::wait()
 		handleRequest();
 		
 		flag_reqMade = false;
-		close(browserSocket);
 		close(webServerSocket);
+		close(browserSocket);
+		webServerSocket = -1;
 	}
 }
 
 // Small thanks to: https://www.geeksforgeeks.org/socket-programming-cc/ and http://www.bogotobogo.com/cplusplus/sockets_server_client.php
 // Once this method is done it will return to where it was called in the wait method. 
 // Note: I am forcing a Connection: close, thus we need to reconnect to the webserver before every send
-void ClientHandler::handleRequest() // During handle request there is no interference!! This means I do not need to worry about mutexes
+// During handle request there is no interference!! This means I do not need to worry about mutexes
+void ClientHandler::handleRequest() 
 {
+	bool slowDown = false;
+
 	// Handle this request, as well as anything else this request needs from the webserver. Furture browser requests create a new ClientHandler. 
 	char browserInput[HEADER_RESPONSE_EST_SIZE] = {0}; // This the request data sent from the browser. (header size is not known pre fetch, so must over est. it).
 	bool endOfBrowserIn = false;
@@ -90,19 +95,6 @@ void ClientHandler::handleRequest() // During handle request there is no interfe
 			endOfBrowserIn = true;
 	}
 	std::string str_browserInput(browserInput, browserInBytes);
-	unsigned int connLoc = str_browserInput.find("Connection: "); // This bit with the Connection: part forces everything to be as Connection: closed, as I'm not implementing a timing function to handle keep-alive. 
-	if(connLoc != std::string::npos)
-	{
-		str_browserInput.replace(connLoc + 12, 10, "close"); // This is fine as keep-alive is longer than close, so it can replace it fully. 
-		browserInBytes -= 5;
-	}
-	else
-	{
-		// No Connection argument, ensure we use Connection: close. Note browserInBytes - 3 is at the X in: value\r\nX\r\n
-		char conMethod[20] = "Connection: close\r\n";
-		str_browserInput.insert(str_browserInput.rfind("\r\n"), conMethod, 19); // I only insert 19 as I want to avoid the \0.
-		browserInBytes += 19;
-	}
 	
 	if(!connectWebserver(str_browserInput))
 	{
@@ -111,15 +103,27 @@ void ClientHandler::handleRequest() // During handle request there is no interfe
 		return;
 	}
 	
-	// This section is used to swap the GET or POST to be a HEAD so we can get header length and content-length for later. 
-	std::string str_headReq(str_browserInput.c_str(), browserInBytes);
+	if(str_browserInput.find("Connection: ") != std::string::npos)
+	{
+		// Replace keep-alive. 
+		str_browserInput.replace(str_browserInput.find("Connection: ") + 12, 10, "close"); // This is fine as keep-alive is longer than close, so it can replace it fully. 
+	}
+	else
+	{
+		// Add in close to header.
+		char conMethod[20] = "Connection: close\r\n";
+		str_browserInput.insert(str_browserInput.rfind("\r\n"), conMethod, 19); // I only insert 19 as I want to avoid the \0. Note that this is reverse find.
+	}
+	
+	// This section is used to swap the GET or POST to be a HEAD so we can get header length and content-length for later. This also lets us get file type and if range is allowed. 
+	std::string str_headReq(str_browserInput.c_str(), str_browserInput.size());
 	if(str_browserInput.find("GET ") != std::string::npos) // We found GET
 	{
 		std::cout << "GET: " << getStringAt("GET ", str_browserInput) << std::endl;
 		
 		str_headReq.erase(0, 3); // Remove GET
 		str_headReq.assign("HEAD" + str_headReq); // Recreate with HEAD at start
-		send(webServerSocket, str_headReq.c_str(), browserInBytes + 1, 0); // browserInBytes + 1 as we went from GET to HEAD
+		send(webServerSocket, str_headReq.c_str(), str_headReq.size(), 0); 
 	}
 	else // POST
 	{
@@ -127,14 +131,13 @@ void ClientHandler::handleRequest() // During handle request there is no interfe
 		
 		str_headReq.erase(0, 4); // Remove POST
 		str_headReq.assign("HEAD" + str_headReq); // Recreate with HEAD at start
-		send(webServerSocket, str_headReq.c_str(), browserInBytes, 0);
+		send(webServerSocket, str_headReq.c_str(), str_headReq.size(), 0);
 	}
 	
-	// Process needed data from the header (bytes in header and body, range requests allowed.)
+	// Store needed data from the header (bytes in header and body, range requests allowed.)
 	char headResp[HEADER_RESPONSE_EST_SIZE] = {0};
 	bool endOfHeader = false;
 	int headBytes = 0;// headBytes corresponds to the exact number of bytes in the header portion for the GET as well
-	int bodyBytes = 0;
 	while(!endOfHeader) // This works fine cause its just a HEAD request, meaning we get nothing but the header. 
 	{
 		int rv = recv(webServerSocket, headResp + headBytes, HEADER_RESPONSE_EST_SIZE - headBytes, 0);
@@ -143,63 +146,108 @@ void ClientHandler::handleRequest() // During handle request there is no interfe
 			endOfHeader = true;
 	}
 	std::string str_headResp(headResp, headBytes);
-	int httpCode = stringToInt(getStringAt("HTTP/1.1 ", str_headResp).substr(0, 3));
 	
-	connectWebserver(str_browserInput);
-	send(webServerSocket, str_browserInput.c_str(), browserInBytes, 0);
-	
-	if(str_headResp.find("Content-Length: ") == std::string::npos) // Note this is from the HEAD request, which may not have gotten content length if the page is dynamically created.
+	// If we have the desired file type check to see if we can do range requets in bytes
+	if((str_headResp.find("Content-Type: ") != std::string::npos) && (getStringAt("Content-Type: ", str_headResp).find("html") != std::string::npos) 
+		&& (str_headResp.find("Accept-Ranges: ") != std::string::npos) && (getStringAt("Accept-Ranges: ", str_headResp).find("bytes") != std::string::npos))
 	{
-		char getHeadResp[HEADER_RESPONSE_EST_SIZE] = {0};
-		headBytes = 0;
-		unsigned int headEnd = 0;
-		while(true)
+		std::string str_range = "Range: bytes=0-" + std::to_string(RANGE_AMOUNT - 1) + "\r\n";
+		str_browserInput.insert(str_browserInput.rfind("\r\n"), str_range.c_str(), str_range.size());
+		slowDown = true;
+	}
+
+	connectWebserver(str_browserInput);
+	send(webServerSocket, str_browserInput.c_str(), str_browserInput.size(), 0);
+	
+	// Read in the GET response. 
+	char getResp[HEADER_RESPONSE_EST_SIZE] = {0};
+	int getHeaderbytes = 0;
+	unsigned int headEnd = 0;
+	while(true) // I do not need to make slowDown requests in here. The request for this response is to make sure dynamic documents are loaded so that content-length can be grabbed. 
+	{
+		int rv = recv(webServerSocket, getResp + getHeaderbytes, HEADER_RESPONSE_EST_SIZE - getHeaderbytes, 0);
+		if(rv == 0)
+			break;
+		
+		std::string str_resp(getResp + getHeaderbytes, rv); // Do not use -1 after getHeaderbytes because we do the += after this, thus it is already on the proper position (just think).
+		getHeaderbytes += rv;
+		headEnd = str_resp.find("\r\n\r\n");
+		
+		if(getHeaderbytes == 2 && str_resp.find("\r\n") != std::string::npos) // Empty Header
 		{
-			int rv = recv(webServerSocket, getHeadResp + headBytes, HEADER_RESPONSE_EST_SIZE - headBytes, 0);
-			if(rv == 0)
-				break;
-			
-			std::string str_resp(getHeadResp + headBytes, rv);
-			headBytes += rv;
-			
-			if(headBytes == 2 && str_resp.find("\r\n") != std::string::npos) // Empty Header
-				break;
-			
-			else if((headEnd = str_resp.find("\r\n\r\n")) != std::string::npos) // End of Header
-				break;
+			headEnd = 2;
+			break;
 		}
 		
-		std::string str_getHeadResp(getHeadResp, headBytes);
-		send(browserSocket, getHeadResp, headBytes, 0); // Send the Header bytes here, then later we read in the body and send it. (Done like this to avoid another GET request).
-		if(str_getHeadResp.find("Content-Length: ") == std::string::npos) // Still no content-length, so we will assume there is no body for whatever reason. 
-			return;
-		
-		// The recv above is guranteed to fetch all of the header, however it might also fetch some of the body, this portion of the body fetched is already sent with the header. 
-		bodyBytes = stringToInt(getStringAt("Content-Length: ", str_getHeadResp)) - (headBytes - (headEnd + 4));
-		headBytes = 0;
+		else if(headEnd != std::string::npos) // End of Header
+			break;
 	}
-	else // Happens most often
-		bodyBytes = stringToInt(getStringAt("Content-Length: ", str_headResp));
-		
-	if(httpCode >= 300 && bodyBytes == 0) // Sometimes no body message is sent, so we return for a 300 or > code. If there is a body message we continue on. 
-	{
-		send(browserSocket, str_headResp.c_str(), headBytes, 0);
+	std::string str_getResp(getResp, getHeaderbytes);
+	
+	if(str_getResp.find("Content-Length: ") == std::string::npos) // No content-length, so we will assume there is no body for whatever reason. 
 		return;
-	}
-		
-	int size = headBytes + bodyBytes;
-	int bytesGet = size;
-	char* finalResponse = new char[size]; // Don't do this on the stack, cause we might get an overflow exception. Firefox couldnt update, so i did some calcs on the content-length. It was ~19MB and cygwin stack is 1.8MB
-	while(bytesGet > 0) // Some sites may stop sending because its EOF, even though the full file size has not been sent, I dunno why, but when this happens recv returns 0. 
+	
+	// The recv above is guranteed to fetch all of the header, however it might also fetch some of the body, this portion of the body fetched is already sent with the header. 
+	int bodyBytes = 0;
+	if(slowDown) // Range uses the end of Content-Range for the full amount. 
 	{
-		int rv = recv(webServerSocket, finalResponse + size - bytesGet, bytesGet, 0); // I know recv blocks, own thread, and lets it be compatible with windows + unix.
-		bytesGet -= rv;
-		if(rv == 0)
+		bodyBytes = stringToInt(getStringAt("Content-Range: bytes 0-" + std::to_string(RANGE_AMOUNT - 1) + "/", str_getResp)) - (getHeaderbytes - (headEnd + 4)); // The getStringAt is always that. 
+		
+		// I need to change the content-length to be the full amount before sending back to the browser so it accepts the full file. 
+		str_getResp.erase(str_getResp.find("Content-Length: ") + 16, getStringAt("Content-Length: ", str_getResp).length());
+		str_getResp.insert(str_getResp.find("Content-Length: ") + 16, std::to_string(bodyBytes + (getHeaderbytes - (headEnd + 4))));
+	}
+	else
+		bodyBytes = stringToInt(getStringAt("Content-Length: ", str_getResp)) - (getHeaderbytes - (headEnd + 4));
+		
+	if(bodyBytes <= 0) // Sometimes no body message is sent, so we return.
+		return;
+		
+	send(browserSocket, str_getResp.c_str(), str_getResp.size(), 0); // Send the Header bytes here, then later we read in the body and send it. (Done like this to avoid another GET request).
+	
+	int rangeCount = 2;
+	int bytesRemaining = bodyBytes;
+	char* finalResponse = new char[bodyBytes]; // Don't do this on the stack, cause we might get an overflow exception. Firefox couldnt update, so i did some calcs on the content-length. It was ~19MB and cygwin stack is 1.8MB
+	while(bytesRemaining > 0) // Some sites may stop sending because its EOF, even though the full file size has not been sent, I dunno why, but when this happens recv returns 0. 
+	{
+		if(slowDown && (RANGE_AMOUNT * (rangeCount - 1)) <= bodyBytes)
+		{
+			str_browserInput.erase(str_browserInput.rfind("=") + 1, std::string::npos);
+			str_browserInput += std::to_string(RANGE_AMOUNT * (rangeCount - 1)) + "-" + std::to_string(RANGE_AMOUNT * rangeCount - 1) + "\r\n\r\n"; // This is always the last line.
+			rangeCount++;
+			
+			connectWebserver(str_browserInput);
+			send(webServerSocket, str_browserInput.c_str(), str_browserInput.size(), 0);	
+		}
+		
+		int bytesGrabbed;
+		if(slowDown)
+		{
+			char resp[RANGE_AMOUNT + HEADER_RESPONSE_EST_SIZE] = {0};
+			bytesGrabbed = recv(webServerSocket, resp, RANGE_AMOUNT + HEADER_RESPONSE_EST_SIZE, 0); 
+		
+			int bodyStart = 4;
+			for(; bodyStart < HEADER_RESPONSE_EST_SIZE; bodyStart++)
+				if((resp[bodyStart - 4] == '\r' && resp[bodyStart - 3] == '\n' && resp[bodyStart - 2] == '\r' && resp[bodyStart - 1] == '\n')) // End of header
+					break;
+					
+			bytesRemaining -= (bytesGrabbed - bodyStart);
+			
+			for(int i = bodyStart; i < bytesGrabbed; i++)
+				finalResponse[bodyBytes - bytesRemaining + (i - bodyStart)] = resp[i];
+		}
+		else
+		{
+			bytesGrabbed = recv(webServerSocket, finalResponse + bodyBytes - bytesRemaining, bytesRemaining, 0); // I know recv blocks, own thread, and lets it be compatible with windows + unix.
+			bytesRemaining -= bytesGrabbed;
+		}
+		
+		if(bytesGrabbed == 0)
 			break;
 	}
 	
-	// I could send right after recieving in the while, but then I would need to block until the send is done each time. 
-	send(browserSocket, finalResponse, size, 0); // Browser connection does not need to be checked for close.
+	// I could send right after recieving in the while, but then I would need to block until the send is done each time. std::cout << str_getResp << std::string(finalResponse, bodyBytes) << std::endl;
+	send(browserSocket, finalResponse, bodyBytes, 0); // Browser connection does not need to be checked for close.
 	delete[] finalResponse;
 }
 
@@ -212,6 +260,9 @@ bool ClientHandler::connectWebserver(const std::string &str_initBrowserReq)
 	std::string str_hostIP(getStringAt("Host: ", str_initBrowserReq));
 	
 	// Start building the socket
+	if(webServerSocket != -1)
+		close(webServerSocket);
+	
 	webServerSocket = socket(AF_INET, SOCK_STREAM, 0);
 	if(webServerSocket < 0)
 	{
