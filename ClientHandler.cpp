@@ -219,14 +219,23 @@ void ClientHandler::handleRequest()
 	int bodyBytes = 0;
 	if(slowDown) // Range uses the end of Content-Range for the full amount. 
 	{
-		bodyBytes = stringToInt(getStringAt("Content-Range: bytes 0-" + std::to_string(server->sloxyRangeRate - 1) + "/", str_getResp)); // The getStringAt is always that. 
+		bodyBytes = stringToInt(getStringAt("Content-Range: bytes 0-" + std::to_string(std::stoi(getStringAt("Content-Length: ", str_getResp)) - 1) + "/", str_getResp)); // The first getStringAt is always that. 
 		
 		// I need to change the content-length to be the full amount before sending back to the browser so it accepts the full file. 
 		str_getResp.erase(str_getResp.find("Content-Length: ") + 16, getStringAt("Content-Length: ", str_getResp).length());
 		str_getResp.insert(str_getResp.find("Content-Length: ") + 16, std::to_string(bodyBytes));
 		
-		 // Remove both the bodybytes obtained in the header recv and the following straggler pickup
-		 bodyBytes -= getHeaderBodyExtraBytes;
+		// Remove both the bodybytes obtained in the header recv and the following straggler pickup
+		bodyBytes -= getHeaderBodyExtraBytes;
+		 
+		// remove partial content response values.
+		str_getResp.erase(9, 19); // Starts with http/1.1 206 Partial Content
+		str_getResp.insert(9, "200 OK");
+		
+		int contentRangeStart = str_getResp.find("Content-Range: ");
+		int end = contentRangeStart;
+		for(; str_getResp[end] != '\r'; end++);
+		str_getResp.erase(contentRangeStart, end + 2 - contentRangeStart); // Remove partial content header
 	}
 	else
 		bodyBytes = stringToInt(getStringAt("Content-Length: ", str_getResp)) - (getHeaderbytes - (headEnd + 4));
